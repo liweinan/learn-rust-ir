@@ -63,7 +63,9 @@ fn foo() -> impl Future<Output = ()> {
 
 ## 情况一：async fn 中没有 .await（只有同步代码）
 
-**注意**：`async fn` 和 `async block` 都生成 `Future`。它们的处理方式完全相同，区别仅在于：
+**重要说明：`async fn` 和 `async block` 都生成 `Future`**
+
+`async fn` 和 `async block` 的处理方式完全相同，区别仅在于：
 - `async fn`：函数体被转换为一个 coroutine（`CoroutineSource::Fn`）
 - `async block`：块表达式被转换为一个 coroutine（`CoroutineSource::Block`）
 - `async closure`：闭包体被转换为一个 coroutine（`CoroutineSource::Closure`）
