@@ -1189,9 +1189,225 @@ Body {
 
 MIR 输出中的文本表示是这些数据结构的格式化输出。实际的 MIR 是内存中的数据结构（`Body`, `BasicBlockData`, `Statement`, `Terminator` 等），编译器在这些数据结构上进行借用检查、优化和代码生成。
 
+## MIR 到二进制代码的编译流程
+
+MIR 是编译器的中间表示，它需要经过多个阶段才能最终生成可执行的二进制代码。以下是完整的编译流程：
+
+### 整体流程
+
+```
+MIR (中级中间表示)
+    ↓ [1. Monomorphization Collection - 单态化收集]
+收集需要生成代码的具体类型
+    ↓ [2. Lowering MIR to LLVM IR - MIR 到 LLVM IR 的转换]
+LLVM IR (低级中间表示)
+    ↓ [3. LLVM Optimization Passes - LLVM 优化]
+优化后的 LLVM IR
+    ↓ [4. LLVM Code Generation - LLVM 代码生成]
+目标平台汇编代码 / 机器码
+    ↓ [5. Linking - 链接]
+最终可执行二进制文件
+```
+
+### 详细步骤
+
+#### 1. Monomorphization Collection（单态化收集）
+
+**目的**：收集需要生成代码的具体类型，因为泛型代码需要为每个具体类型生成一份副本。
+
+**位置**：`compiler/rustc_monomorphize/src/collector.rs`
+
+**过程**：
+- 遍历 MIR，找出所有需要单态化的项（mono items）
+- 对于泛型函数 `fn foo<T>()`，如果被 `foo::<i32>()` 和 `foo::<u64>()` 调用，则需要为 `i32` 和 `u64` 各生成一份代码
+- 生成一个"代码生成单元"（codegen unit）列表，每个单元包含一组相关的 mono items
+
+**关键概念**：
+- **Monomorphization（单态化）**：将泛型代码转换为具体类型的代码
+- **Codegen Unit（代码生成单元）**：一组相关的 mono items，可以并行编译
+
+#### 2. Lowering MIR to LLVM IR（MIR 到 LLVM IR 的转换）
+
+**目的**：将 MIR 转换为 LLVM IR（低级中间表示），这是 LLVM 可以理解和优化的格式。
+
+**入口函数**：`rustc_codegen_ssa::mir::codegen_mir`（`compiler/rustc_codegen_ssa/src/mir/mod.rs` 第 173 行）
+
+**转换模块**：
+- **`rustc_codegen_ssa::mir::block`**：转换基本块和终止符
+    - 处理函数调用、异常处理（unwinding）
+    - 生成 `switchInt`、`goto`、`return` 等终止符的 LLVM IR
+- **`rustc_codegen_ssa::mir::statement`**：转换 MIR 语句
+    - `Assign` → LLVM IR 赋值指令
+    - `SetDiscriminant` → LLVM IR 判别式设置
+    - `StorageLive`/`StorageDead` → LLVM IR 内存分配/释放
+- **`rustc_codegen_ssa::mir::operand`**：转换操作数
+    - `Operand::Copy` → LLVM IR 复制操作
+    - `Operand::Move` → LLVM IR 移动操作
+    - `Operand::Const` → LLVM IR 常量
+- **`rustc_codegen_ssa::mir::place`**：转换位置引用
+    - `Place` → LLVM IR 内存地址计算
+    - 处理字段访问、数组索引、解引用等
+- **`rustc_codegen_ssa::mir::rvalue`**：转换右值
+    - `Rvalue::Use` → LLVM IR 值使用
+    - `Rvalue::BinaryOp` → LLVM IR 二元运算
+    - `Rvalue::Discriminant` → LLVM IR 判别式读取
+    - `Rvalue::Aggregate` → LLVM IR 聚合值构造
+
+**分析阶段**：
+在转换之前，会运行一些分析 pass 来优化生成的 LLVM IR：
+- **SSA 分析**（`rustc_codegen_ssa::mir::analyze`）：识别哪些变量是 SSA 形式的，可以直接转换为 SSA，而不需要依赖 LLVM 的 `mem2reg` pass
+- **清理类型分析**：分析哪些基本块是 cleanup 块，用于异常处理
+
+**映射关系**：
+- 一个 MIR 基本块通常对应一个 LLVM 基本块
+- 函数调用、断言等复杂操作可能生成多个 LLVM 基本块
+- MIR 的 `switchInt` 直接映射到 LLVM 的 `switch` 指令
+
+#### 3. LLVM Optimization Passes（LLVM 优化）
+
+**目的**：对 LLVM IR 进行优化，提高代码性能。
+
+**位置**：`compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp`
+
+**优化级别**：
+- **`-O0`（无优化）**：几乎不进行优化，编译速度快
+- **`-O1`（基本优化）**：进行基本的优化，平衡编译速度和运行速度
+- **`-O2`（标准优化）**：进行标准优化，通常用于发布版本
+- **`-O3`（激进优化）**：进行更激进的优化，可能增加编译时间
+
+**常见优化 Pass**：
+- **`mem2reg`**：将内存操作转换为寄存器操作（SSA 形式）
+- **`instcombine`**：指令合并，简化指令序列
+- **`deadcodeelimination`**：死代码消除
+- **`loop-unroll`**：循环展开
+- **`inline`**：函数内联
+- **`gvn`**（Global Value Numbering）：全局值编号，消除冗余计算
+
+**LTO（Link-Time Optimization）**：
+- **ThinLTO**：在链接时进行跨模块优化
+- **FullLTO**：在链接时进行全局优化
+
+#### 4. LLVM Code Generation（LLVM 代码生成）
+
+**目的**：将优化后的 LLVM IR 转换为目标平台的汇编代码或机器码。
+
+**位置**：LLVM 后端（`rustc_codegen_llvm` 调用 LLVM API）
+
+**过程**：
+1. **指令选择**：将 LLVM IR 指令映射到目标平台的机器指令
+2. **寄存器分配**：将虚拟寄存器分配到物理寄存器
+3. **指令调度**：重新排列指令顺序，提高指令级并行性
+4. **代码发射**：生成目标平台的汇编代码或直接生成机器码（目标文件）
+
+**输出格式**：
+- **汇编代码**（`.s` 文件）：人类可读的汇编代码
+- **目标文件**（`.o` 文件）：机器码，包含符号表和重定位信息
+- **LLVM Bitcode**（`.bc` 文件）：LLVM IR 的二进制格式
+
+#### 5. Linking（链接）
+
+**目的**：将多个目标文件链接成最终的可执行文件或库。
+
+**位置**：`compiler/rustc_codegen_ssa/src/back/write.rs` 和 `compiler/rustc_codegen_llvm/src/back/write.rs`
+
+**过程**：
+1. **符号解析**：解析所有未定义的符号引用
+2. **重定位**：修正目标文件中的地址引用
+3. **代码生成单元合并**：将多个代码生成单元的目标文件合并
+4. **元数据链接**：链接 Rust 元数据（用于增量编译、文档生成等）
+5. **最终输出**：
+    - **可执行文件**（`a.out`、`.exe`）：可以直接运行的程序
+    - **静态库**（`.a`、`.lib`）：包含所有代码的库文件
+    - **动态库**（`.so`、`.dll`、`.dylib`）：运行时加载的库文件
+
+**链接器**：
+- **系统链接器**：`ld`（Unix）、`link.exe`（Windows）、`lld`（LLVM 链接器）
+- **Rust 链接器**：可以使用自定义链接器（通过 `-C linker` 选项）
+
+### 关键文件位置
+
+#### Monomorphization Collection
+- **`compiler/rustc_monomorphize/src/collector.rs`**：单态化收集器
+- **`compiler/rustc_monomorphize/src/partitioning.rs`**：代码生成单元划分
+
+#### MIR to LLVM IR Lowering
+- **`compiler/rustc_codegen_ssa/src/mir/mod.rs`**：MIR 转换入口
+- **`compiler/rustc_codegen_ssa/src/mir/block.rs`**：基本块和终止符转换
+- **`compiler/rustc_codegen_ssa/src/mir/statement.rs`**：语句转换
+- **`compiler/rustc_codegen_ssa/src/mir/operand.rs`**：操作数转换
+- **`compiler/rustc_codegen_ssa/src/mir/place.rs`**：位置转换
+- **`compiler/rustc_codegen_ssa/src/mir/rvalue.rs`**：右值转换
+- **`compiler/rustc_codegen_ssa/src/mir/analyze.rs`**：分析 pass
+
+#### LLVM 后端
+- **`compiler/rustc_codegen_llvm/src/lib.rs`**：LLVM 后端入口
+- **`compiler/rustc_codegen_llvm/src/back/write.rs`**：LLVM IR 写入和链接
+- **`compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp`**：LLVM Pass 包装器
+
+#### 后端抽象
+- **`compiler/rustc_codegen_ssa/src/traits/backend.rs`**：后端 trait 定义
+- **`compiler/rustc_codegen_ssa/src/base.rs`**：后端通用代码
+
+### 查看中间产物
+
+#### 查看 LLVM IR
+```bash
+# 生成 LLVM IR 文本格式
+cargo rustc -- --emit=llvm-ir
+
+# 生成 LLVM Bitcode
+cargo rustc -- --emit=llvm-bc
+```
+
+#### 查看汇编代码
+```bash
+# 生成汇编代码
+cargo rustc -- --emit=asm
+```
+
+#### 查看目标文件
+```bash
+# 生成目标文件（.o）
+cargo rustc -- --emit=obj
+```
+
+### 多后端支持
+
+Rust 编译器支持多个代码生成后端：
+
+1. **LLVM 后端**（默认）：
+    - 位置：`compiler/rustc_codegen_llvm`
+    - 优点：优化能力强，支持平台广泛
+    - 缺点：编译时间较长
+
+2. **Cranelift 后端**（实验性）：
+    - 位置：`compiler/rustc_codegen_cranelift`
+    - 优点：编译速度快
+    - 缺点：优化能力较弱，主要用于调试
+
+3. **GCC 后端**（实验性）：
+    - 位置：`compiler/rustc_codegen_gcc`
+    - 优点：可以使用 GCC 的优化和工具链
+    - 状态：仍在开发中
+
+### 总结
+
+MIR 到二进制代码的编译流程是一个多阶段的过程：
+
+1. **单态化收集**：确定需要生成代码的具体类型
+2. **MIR 到 LLVM IR**：将高级中间表示转换为低级中间表示
+3. **LLVM 优化**：对 LLVM IR 进行各种优化
+4. **代码生成**：将 LLVM IR 转换为目标平台的机器码
+5. **链接**：将多个目标文件链接成最终的可执行文件
+
+整个过程充分利用了 LLVM 的强大优化能力和多平台支持，同时保持了 Rust 的类型安全和内存安全特性。
+
 ## 相关资源
 
 - [Rust 编译器开发指南 - HIR](https://rustc-dev-guide.rust-lang.org/hir.html)
 - [Rust 编译器开发指南 - MIR](https://rustc-dev-guide.rust-lang.org/mir/index.html)
+- [Rust 编译器开发指南 - Codegen](https://rustc-dev-guide.rust-lang.org/backend/codegen.html)
+- [Rust 编译器开发指南 - Lowering MIR](https://rustc-dev-guide.rust-lang.org/backend/lowering-mir.html)
+- [LLVM 官方文档](https://llvm.org/docs/)
 - [Rust Playground](https://play.rust-lang.org/) - 可以在线查看 MIR 输出
 
