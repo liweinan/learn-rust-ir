@@ -206,6 +206,11 @@ unsafe impl Sync for ResumeTy {}
 ## 情况二：引入 .await（出现真正的暂停点）
 
 ```rust
+// 假设有一个返回 Future 的函数
+fn some_other_future() -> impl Future<Output = ()> {
+    futures::future::ready(())
+}
+
 async fn foo() -> i32 {
     let mut x = 1;
     x = x + 1;                  // 同步操作，x == 2
@@ -222,6 +227,50 @@ async fn foo() -> i32 {
     x                           // 返回 x
 }
 ```
+
+**关于 `some_other_future()`**：
+
+`some_other_future()` 是一个返回 `impl Future<Output = ()>` 的函数。它可以是：
+- 另一个 `async fn` 的调用
+- `async` 块的调用
+- 任何实现了 `Future` trait 的类型（如 `futures::future::Ready<T>`、`futures::future::Pending` 等）
+
+**`.await` 的去糖过程**：
+
+`some_other_future().await` 会被去糖为以下伪 Rust 代码：
+
+```rust
+// 1. 首先调用 IntoFuture::into_future 将表达式转换为 Future
+//    对于 ready(())，IntoFuture::into_future 直接返回它本身
+match IntoFuture::into_future(futures::future::ready(())) {
+    mut __awaitee => loop {
+        // 2. 在循环中调用 Future::poll
+        match unsafe { Future::poll(
+            Pin::new_unchecked(&mut __awaitee),
+            get_context(_task_context),
+        ) } {
+            // 3. 如果 Future 完成，跳出循环，继续执行后续代码
+            Poll::Ready(result) => break result,
+            // 4. 如果 Future 未完成，暂停协程（yield）
+            Poll::Pending => {}
+        }
+        // 5. 暂停点：yield ()，保存当前状态
+        _task_context = yield ();
+    }
+}
+```
+
+**关键点**：
+- `__awaitee` 是编译器生成的临时变量，用于保存正在等待的 Future
+- `_task_context` 是协程的参数，类型为 `ResumeTy`，用于传递 `Context`
+- `yield ()` 是协程的暂停点，会保存当前状态并返回 `CoroutineState::Yielded(())`
+- 当 Future 完成时，`poll` 返回 `Poll::Ready(result)`，协程恢复执行后续代码
+
+**实际编译器代码位置**：
+
+**文件**: `compiler/rustc_ast_lowering/src/expr.rs`（第 829-1042 行）
+
+编译器在 `lower_expr_await` 和 `make_lowered_await` 函数中实现 `.await` 的去糖逻辑。
 
 ### 编译后大致等价于（手动去糖）
 
@@ -254,9 +303,16 @@ struct FooFuture {
 }
 ```
 
-**状态枚举的生成机制**：
+**关于状态枚举的说明**：
 
-编译器**不会生成 Rust enum**，而是使用 `u32` 类型的 discriminant（判别值）来表示状态。
+**重要**：文档中的 `enum State` 只是手动去糖的示意，实际编译器生成的是 `u32` 类型的 discriminant（判别值），而不是 Rust enum。
+
+**状态命名和规则**：
+
+- **状态 0**：`Unresumed`（未开始）- 协程尚未被恢复
+- **状态 1**：`Returned`（已完成）- 协程已返回/完成
+- **状态 2**：`Panicked`（已销毁）- 协程在 panic 时被销毁
+- **状态 3+**：`Suspend0`, `Suspend1`, `Suspend2`, ...（暂停点）- 每个 `.await` 对应一个暂停点状态，按出现顺序从 3 开始递增
 
 **Discriminant 类型定义**：
 
@@ -270,253 +326,7 @@ fn discr_ty(&self, tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
 }
 ```
 
-这个方法属于 `CoroutineArgs` trait 的实现（第 63 行），明确指定了 coroutine 状态使用 `u32` 类型作为 discriminant。
-
-**统一的状态命名规范**：
-
-本文档中所有状态都使用以下统一的命名，与编译器实际生成的名称一致：
-
-- **状态 0**：`Unresumed`（未开始）- 协程尚未被恢复
-- **状态 1**：`Returned`（已完成）- 协程已返回/完成
-- **状态 2**：`Panicked`（已销毁）- 协程在 panic 时被销毁
-- **状态 3+**：`Suspend0`, `Suspend1`, `Suspend2`, ...（暂停点）- 每个 `.await` 对应一个暂停点状态
-
-**注意**：文档中的 `enum State` 只是手动去糖的示意，实际编译器生成的是 `u32` 类型的 discriminant，而不是 Rust enum。状态名称（如 `Unresumed`、`Returned`、`Suspend0` 等）是编译器在调试时使用的名称（见 `compiler/rustc_middle/src/ty/sty.rs` 第 116-123 行的 `variant_name` 函数）。
-
-状态生成的规则如下：
-
-1. **三个保留状态**（硬编码，所有 coroutine 都有）：
-   - **状态 0**：`Unresumed`（未开始）- 协程尚未被恢复
-   - **状态 1**：`Returned`（已完成）- 协程已返回/完成
-   - **状态 2**：`Panicked`（已销毁）- 协程在 panic 时被销毁
-
-2. **动态分配的暂停点状态**：
-   - 每个 `.await`（yield 点）会分配一个状态编号
-   - 状态编号从 **3** 开始（`RESERVED_VARIANTS = 3`）
-   - 按照 `.await` 出现的顺序递增：第一个 `.await` 是状态 3，第二个是状态 4，以此类推
-
-3. **状态分配代码和逻辑**：
-
-状态编号的生成发生在 MIR Transform 阶段，由 `StateTransform` pass 完成。
-
-**核心数据结构**：
-
-**文件**: `compiler/rustc_mir_transform/src/coroutine.rs`（第 177-189 行，第 191-216 行）
-
-```rust
-/// 表示一个 yield 点（暂停点）
-struct SuspensionPoint<'tcx> {
-    /// State discriminant used when suspending or resuming at this point.
-    state: usize,  // 状态编号
-    /// The block to jump to after resumption.
-    resume: BasicBlock,  // 恢复时跳转的目标块
-    /// Where to move the resume argument after resumption.
-    resume_arg: Place<'tcx>,  // resume 参数的位置
-    /// Which block to jump to if the coroutine is dropped in this state.
-    drop: Option<BasicBlock>,  // drop 时跳转的目标块
-    /// Set of locals that have live storage while at this suspension point.
-    storage_liveness: GrowableBitSet<Local>,  // 在此暂停点存活的变量
-}
-
-struct TransformVisitor<'tcx> {
-    // ...
-    /// 存储所有遇到的暂停点
-    suspension_points: Vec<SuspensionPoint<'tcx>>,  // 初始化为空 Vec
-    // ...
-}
-```
-
-**状态编号计算公式**：
-
-**文件**: `compiler/rustc_mir_transform/src/coroutine.rs`（第 465 行）
-
-```rust
-let state = CoroutineArgs::RESERVED_VARIANTS + self.suspension_points.len();
-```
-
-**公式说明**：
-- `RESERVED_VARIANTS = 3`（状态 0、1、2 是保留的）
-- `suspension_points.len()` 是当前已收集的暂停点数量
-- **第一个 yield 点**：`state = 3 + 0 = 3`
-- **第二个 yield 点**：`state = 3 + 1 = 4`
-- **第三个 yield 点**：`state = 3 + 2 = 5`
-- 以此类推...
-
-**完整的状态分配流程**：
-
-**文件**: `compiler/rustc_mir_transform/src/coroutine.rs`（第 460-497 行）
-
-```rust
-// 1. TransformVisitor 遍历 MIR body，当遇到 Yield terminator 时
-TerminatorKind::Yield { ref value, resume, mut resume_arg, drop } => {
-    let source_info = data.terminator().source_info;
-    
-    // 2. 首先处理 yield 的值（生成 CoroutineState::Yielded 或 Poll::Pending）
-    self.make_state(value.clone(), source_info, false, &mut data.statements);
-    
-    // 3. 【关键步骤】计算状态编号
-    // 公式：RESERVED_VARIANTS (3) + 当前已收集的暂停点数量
-    let state = CoroutineArgs::RESERVED_VARIANTS + self.suspension_points.len();
-    // 此时 suspension_points 中还没有当前这个暂停点，所以 len() 就是之前暂停点的数量
-    
-    // 4. 处理 resume_arg（如果它需要跨 yield 保存，需要 remap）
-    if let Some(&Some((ty, variant, idx))) = self.remap.get(resume_arg.local) {
-        replace_base(&mut resume_arg, self.make_field(variant, idx, ty), self.tcx);
-    }
-    
-    // 5. 获取在此暂停点存活的变量集合
-    let storage_liveness: GrowableBitSet<Local> =
-        self.storage_liveness[block].clone().unwrap().into();
-    
-    // 6. 为需要存储的变量生成 StorageDead 指令
-    for i in 0..self.always_live_locals.domain_size() {
-        let l = Local::new(i);
-        let needs_storage_dead = storage_liveness.contains(l)
-            && !self.remap.contains(l)
-            && !self.always_live_locals.contains(l);
-        if needs_storage_dead {
-            data.statements
-                .push(Statement::new(source_info, StatementKind::StorageDead(l)));
-        }
-    }
-    
-    // 7. 【关键步骤】创建 SuspensionPoint 并添加到 suspension_points 中
-    self.suspension_points.push(SuspensionPoint {
-        state,              // 刚计算的状态编号
-        resume,             // 恢复时跳转的目标块
-        resume_arg,         // resume 参数的位置
-        drop,               // drop 时跳转的目标块
-        storage_liveness,   // 在此暂停点存活的变量
-    });
-    
-    // 8. 【关键步骤】设置 discriminant 为这个状态编号
-    // 将 usize 转换为 VariantIdx，然后生成 SetDiscriminant 语句
-    let state = VariantIdx::new(state);
-    data.statements.push(self.set_discr(state, source_info));
-    
-    // 9. 将 Yield terminator 替换为 Return
-    data.terminator_mut().kind = TerminatorKind::Return;
-}
-```
-
-**`set_discr` 方法的实现**：
-
-**文件**: `compiler/rustc_mir_transform/src/coroutine.rs`（第 363-372 行）
-
-```rust
-fn set_discr(&self, state_disc: VariantIdx, source_info: SourceInfo) -> Statement<'tcx> {
-    let self_place = Place::from(SELF_ARG);
-    Statement::new(
-        source_info,
-        StatementKind::SetDiscriminant {
-            place: Box::new(self_place),  // 设置 self.state 字段
-            variant_index: state_disc,    // 设置为计算出的状态编号
-        },
-    )
-}
-```
-
-**执行顺序示例**：
-
-假设有以下代码：
-```rust
-async fn example() {
-    future1().await;  // 第一个 yield 点
-    future2().await;  // 第二个 yield 点
-    future3().await;  // 第三个 yield 点
-}
-```
-
-编译器遍历 MIR 时的执行顺序：
-
-1. **遇到第一个 `yield`**：
-   - `suspension_points.len() = 0`
-   - `state = 3 + 0 = 3`
-   - 创建 `SuspensionPoint { state: 3, ... }`
-   - 添加到 `suspension_points`（现在 `len() = 1`）
-
-2. **遇到第二个 `yield`**：
-   - `suspension_points.len() = 1`
-   - `state = 3 + 1 = 4`
-   - 创建 `SuspensionPoint { state: 4, ... }`
-   - 添加到 `suspension_points`（现在 `len() = 2`）
-
-3. **遇到第三个 `yield`**：
-   - `suspension_points.len() = 2`
-   - `state = 3 + 2 = 5`
-   - 创建 `SuspensionPoint { state: 5, ... }`
-   - 添加到 `suspension_points`（现在 `len() = 3`）
-
-**关键点**：
-- 状态编号是**按 yield 点出现的顺序**分配的
-- 每个 yield 点分配一个**唯一的状态编号**
-- 状态编号从 3 开始，**连续递增**
-- `suspension_points` 的 `len()` 在**添加当前暂停点之前**计算，确保编号连续且唯一
-
-4. **状态切换的实现**：
-
-**文件**: `compiler/rustc_mir_transform/src/coroutine.rs`（第 1249-1301 行）
-
-编译器生成的状态切换逻辑：
-
-```rust
-// 编译器生成的状态切换（简化示意）
-match self.state {
-    0 => {
-        // Unresumed：跳转到 START_BLOCK，开始执行协程
-        START_BLOCK
-    }
-    1 => {
-        // Returned：panic（如果再次 poll 已完成的 Future）
-        panic!("future polled after completion")
-    }
-    2 => {
-        // Panicked：panic（如果再次 poll 已 panic 的协程）
-        panic!("future polled after panic")
-    }
-    3 => {
-        // 第一个暂停点：从第一个 .await 处恢复
-        // 恢复保存的变量，跳转到 resume 块
-    }
-    4 => {
-        // 第二个暂停点：从第二个 .await 处恢复
-    }
-    // ... 更多暂停点
-    _ => unreachable!(),
-}
-```
-
-5. **状态名称**：
-
-**文件**: `compiler/rustc_middle/src/ty/sty.rs`（第 116-123 行）
-
-编译器会根据状态编号生成名称（用于调试）：
-
-```rust
-fn variant_name(v: VariantIdx) -> Cow<'static, str> {
-    match v.as_usize() {
-        0 => "Unresumed",
-        1 => "Returned",
-        2 => "Panicked",
-        n => format!("Suspend{}", n - 3),  // 暂停点命名为 Suspend0, Suspend1, ...
-    }
-}
-```
-
-6. **为什么不是固定的格式**：
-
-- **状态数量不固定**：取决于代码中 `.await` 的数量
-- **状态内容不固定**：每个暂停点需要保存的变量不同（如 `Suspend0(SomeOtherFuture)` 中的 `SomeOtherFuture`）
-- **动态生成**：编译器根据实际的 MIR 分析结果动态生成状态布局
-
-**示例**：如果有两个 `.await`，状态会是：
-- 状态 0：Unresumed
-- 状态 1：Returned
-- 状态 2：Panicked
-- 状态 3：第一个 `.await` 的暂停点
-- 状态 4：第二个 `.await` 的暂停点
-
-**总结**：状态枚举不是固定格式，而是编译器根据代码中的 `.await` 数量和需要保存的变量动态生成的。实际实现使用 `u32` 类型的 discriminant，而不是 Rust enum。
+这个方法属于 `CoroutineArgs` trait 的实现，明确指定了 coroutine 状态使用 `u32` 类型作为 discriminant。状态名称（如 `Unresumed`、`Returned`、`Suspend0` 等）是编译器在调试时使用的名称（见 `compiler/rustc_middle/src/ty/sty.rs` 第 116-123 行的 `variant_name` 函数）。
 
 ```rust
 // Coroutine::resume 包含实际的状态机逻辑
@@ -2361,20 +2171,20 @@ LLVM IR (代码生成)
 // 转换为 MIR 数据结构（简化示意）
 // MIR 中存储为基本块和控制流图
 bb0: {
-_2 = discriminant(_1);  // 检查枚举判别式
-switchInt(_2) -> [0: bb1, 1: bb2];  // 分支
+    _2 = discriminant(_1);  // 检查枚举判别式
+    switchInt(_2) -> [0: bb1, 1: bb2];  // 分支
 }
 bb1: {  // None 分支
-_0 = const 0;
-goto -> bb3;
+    _0 = const 0;
+    goto -> bb3;
 }
 bb2: {  // Some 分支
-_3 = ((_1 as Some).0: i32);  // 解构
-_0 = Add(_3, const 1);
-goto -> bb3;
+    _3 = ((_1 as Some).0: i32);  // 解构
+    _0 = Add(_3, const 1);
+    goto -> bb3;
 }
 bb3: {
-return;
+    return;
 }
 ```
 
@@ -2400,16 +2210,32 @@ return;
 
 在 async/await 的编译过程中：
 
-1. **HIR 阶段**：
-   - `async fn` 被转换为 coroutine 表达式
-   - `.await` 被转换为 `loop { match poll(...) { ... } }` 模式
+1. **HIR 阶段**：coroutine 实现机制 + Future 类型系统抽象（两者并存但分离）
+   - **实现机制**：`async fn` 被转换为 coroutine 闭包表达式
+      - 接收 `ResumeTy` 参数（coroutine 的特征）
+      - 包含 `yield ()` 暂停点（coroutine 的核心机制）
+   - **类型系统**：返回类型是 `impl Future<Output = T>`（opaque type with Future bound）
+   - `.await` 被转换为 `loop { match poll(...) { Ready => break, Pending => yield } }` 模式
    - 仍保留高级语法结构
 
-2. **MIR 阶段**：
-   - coroutine 被转换为状态机
-   - `yield` 和 `return` 被转换为状态设置和 `Poll` 返回
+2. **MIR Transform 阶段**：将 coroutine 和 Future 统一为状态机 + `Future::poll` 实现
+   - **状态机生成**：基于 coroutine 机制生成状态机结构体
+      - 状态字段（discriminant）的生成
+      - 状态变体（variant）的布局计算
+      - 变量提升（locals_live_across_suspend_points）
+   - **函数生成**：根据 coroutine 类型选择生成 `Future::poll` 或 `Coroutine::resume`
+      - 对于 async coroutine：生成 `Future::poll`（返回 `Poll<T>`）
+      - 对于 gen coroutine：生成 `Coroutine::resume`（返回 `CoroutineState<Y, R>`）
+   - **转换映射**：
+      - `yield ()` → 状态设置 + `Poll::Pending`（对于 async）
+      - `return x` → 状态设置 + `Poll::Ready(x)`（对于 async）
    - 生成基于基本块的控制流图
    - 进行借用检查和优化
+
+**关键理解**：
+- **不是"混合"**，而是"统一"：HIR 阶段 coroutine 和 Future 是分离的（实现机制 vs 类型系统），MIR Transform 阶段将它们统一为状态机 + `Future::poll` 实现
+- **Coroutine 是底层机制**：提供"暂停/恢复"的能力，状态机的生成、变量提升等都基于 coroutine 机制
+- **Future 是上层抽象**：类型系统层面的抽象，在 MIR 阶段通过生成 `Future::poll` 实现来体现
 
 **关键文件**：
 - HIR 构建：`compiler/rustc_ast_lowering/src/`
