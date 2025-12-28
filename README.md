@@ -165,6 +165,157 @@ fn foo::{closure#0}(_1: Pin<&mut {async fn body of foo()}>, _2: &mut Context<'_>
 
 **说明**：MIR 也是编译器的内部数据结构，这里显示的是格式化后的文本表示。MIR 是进行借用检查、优化和代码生成的基础。
 
+#### MIR 中的 Coroutine 和 Future 关系
+
+在 MIR 阶段，编译器将 HIR 中的 coroutine 转换为状态机，并生成 `Future::poll` 的实现。理解 coroutine 和 future 的关系对于理解 async/await 的底层机制至关重要。
+
+**核心关系**：
+
+1. **Coroutine 是底层机制**：提供"暂停/恢复"的通用能力
+2. **Future 是上层应用**：利用 coroutine 实现"异步等待"的具体场景
+3. **在 MIR 中**：async coroutine 类型同时实现了 `Coroutine` 和 `Future` 两个 trait
+
+**状态机结构**：
+
+在 MIR 中，编译器生成的状态机结构体布局如下：
+
+```rust
+// 编译器生成的状态机结构体（简化示意）
+struct AsyncCoroutine {
+    // 1. 捕获的变量（upvars，如果有闭包捕获）
+    upvars: ...,
+    
+    // 2. 状态字段（discriminant）
+    state: u32,  // 0 = 未开始, 1 = 完成, 2 = 已销毁, 3+ = 暂停点
+    
+    // 3. 跨暂停点存活的局部变量
+    saved_locals: {
+        y: i32,  // 例如：需要跨 .await 的变量
+        // ... 其他变量
+    },
+}
+```
+
+**Future::poll 和 Coroutine::resume 的关系**：
+
+编译器生成的 async coroutine 类型同时实现了 `Coroutine` 和 `Future` 两个 trait：
+
+```rust
+// 编译器自动为 async coroutine 实现 Future trait
+impl Future for AsyncCoroutine {
+    type Output = T;  // 原函数的返回类型
+    
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        // 这个 poll 方法实际上是对 Coroutine::resume 的包装
+        match self.resume(ResumeTy::from_context(cx)) {
+            CoroutineState::Yielded(_) => Poll::Pending,
+            CoroutineState::Complete(x) => Poll::Ready(x),
+        }
+    }
+}
+
+// 同时，这个类型也实现 Coroutine trait
+impl Coroutine<ResumeTy> for AsyncCoroutine {
+    type Yield = ();
+    type Return = T;
+    
+    fn resume(self: Pin<&mut Self>, arg: ResumeTy) -> CoroutineState<(), T> {
+        // 状态机逻辑：根据当前状态执行代码
+        match self.state {
+            0 => {
+                // 初始状态：执行代码
+                // ... 执行代码 ...
+                if 遇到 yield {
+                    self.state = 暂停点编号;
+                    return CoroutineState::Yielded(());
+                }
+                self.state = 1;
+                return CoroutineState::Complete(result);
+            }
+            n => {
+                // 从暂停点 n 继续
+                // ... 继续执行 ...
+                if 再次遇到 yield {
+                    self.state = 新的暂停点;
+                    return CoroutineState::Yielded(());
+                }
+                self.state = 1;
+                return CoroutineState::Complete(result);
+            }
+        }
+    }
+}
+```
+
+**在 MIR 输出中的体现**：
+
+1. **函数签名**：`foo::{closure#0}` 函数的签名是 `Future::poll` 的签名
+   ```rust
+   fn foo::{closure#0}(
+       _1: Pin<&mut {async fn body of foo()}>,  // self
+       _2: &mut Context<'_>                      // cx
+   ) -> Poll<i32>
+   ```
+
+2. **状态切换**：通过 `discriminant` 和 `switchInt` 实现状态机
+   ```rust
+   _17 = discriminant((*_18));  // 获取当前状态
+   switchInt(move _17) -> [0: bb1, 1: bb15, 2: bb14, 3: bb13, ...];
+   ```
+
+3. **状态转换映射**：
+   - `CoroutineState::Yielded(())` → `Poll::Pending`
+   - `CoroutineState::Complete(x)` → `Poll::Ready(x)`
+
+4. **变量保存**：跨暂停点的变量被保存到状态机结构体中
+   ```rust
+   // 保存变量到状态机
+   (((*_18) as variant#3).0: i32) = move (_4.0: i32);
+   
+   // 从状态机恢复变量
+   _4 = ((*_18) as variant#3).0: i32;
+   ```
+
+**关键转换点**：
+
+在 MIR Transform 阶段（`compiler/rustc_mir_transform/src/coroutine.rs`），`StateTransform` pass 执行以下转换：
+
+1. **yield 表达式转换**（对于 async）：
+   ```rust
+   // 转换前：yield ()
+   yield ();
+   
+   // 转换后：设置状态 + 返回 Poll::Pending
+   self.state = SuspensionPoint1;
+   return Poll::Pending;
+   ```
+
+2. **return 表达式转换**（对于 async）：
+   ```rust
+   // 转换前：return x
+   return x;
+   
+   // 转换后：设置完成状态 + 返回 Poll::Ready
+   self.state = Done;
+   return Poll::Ready(x);
+   ```
+
+3. **局部变量访问转换**：
+   ```rust
+   // 转换前：访问局部变量
+   _1 = 42;
+   
+   // 转换后：访问状态机字段
+   self.field_0 = 42;  // field_0 对应原来的 _1
+   ```
+
+**总结**：
+
+- **Coroutine** 提供了通用的"暂停/恢复"机制，是 `async fn`、`gen fn` 和 `async gen fn` 的底层抽象
+- **Future** 是 coroutine 在异步场景下的具体应用，`Future::poll` 是对 `Coroutine::resume` 的包装
+- 在 MIR 中，状态机同时实现了 `Coroutine` 和 `Future` 两个 trait，通过状态切换实现异步执行
+- 状态机结构体保存了跨暂停点的局部变量，使得协程可以在暂停后恢复执行
+
 ---
 
 ## 转换流程总结
@@ -192,12 +343,14 @@ LLVM IR → 机器码
 - ✅ `_task_context = (yield ())` - 协程暂停点，保存上下文
 
 ### 在 MIR 输出中寻找：
-- ✅ `discriminant((*_18))` - 获取状态机的当前状态
-- ✅ `switchInt(...) -> [0: bb1, 1: bb15, 2: bb14, 3: bb13, ...]` - 状态切换
-- ✅ `(((*_18) as variant#3).0: i32)` - 访问状态机中保存的变量（`y`）
-- ✅ `discriminant((*_18)) = 3` - 设置状态为暂停点
-- ✅ `Poll::<i32>::Pending` / `Poll::<i32>::Ready(...)` - Future 的返回
+- ✅ `discriminant((*_18))` - 获取状态机的当前状态（coroutine 状态）
+- ✅ `switchInt(...) -> [0: bb1, 1: bb15, 2: bb14, 3: bb13, ...]` - 状态切换（coroutine resume 逻辑）
+- ✅ `(((*_18) as variant#3).0: i32)` - 访问状态机中保存的变量（跨暂停点的局部变量）
+- ✅ `discriminant((*_18)) = 3` - 设置状态为暂停点（yield 的转换）
+- ✅ `Poll::<i32>::Pending` / `Poll::<i32>::Ready(...)` - Future 的返回（CoroutineState 到 Poll 的转换）
 - ✅ `bb0`, `bb1`, `bb2`, ... - 基本块（basic blocks）
+- ✅ `fn foo::{closure#0}(_1: Pin<&mut ...>, _2: &mut Context<'_>) -> Poll<i32>` - Future::poll 的实现
+- ✅ `{async fn body of foo()}` - 状态机结构体类型（coroutine 类型）
 
 ### 状态机状态说明（MIR 中）：
 - **状态 0**：未开始，执行初始代码
