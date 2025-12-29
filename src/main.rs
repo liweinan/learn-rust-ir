@@ -5,6 +5,7 @@ async fn foo() -> i32 {
     let y = x + 2;
     
     // 引入一个 .await 来观察状态机的生成
+    // 等价的 async block 写法：async { 42 }.await;
     futures::future::ready(42).await;
     
     let result = y + 10;

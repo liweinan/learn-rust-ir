@@ -206,43 +206,35 @@ unsafe impl Sync for ResumeTy {}
 ## 情况二：引入 .await（出现真正的暂停点）
 
 ```rust
-// 假设有一个返回 Future 的函数
-fn some_other_future() -> impl Future<Output = ()> {
-    futures::future::ready(())
-}
-
 async fn foo() -> i32 {
-    let mut x = 1;
-    x = x + 1;                  // 同步操作，x == 2
+    let x = 1;
+    let y = x + 2;              // 同步操作，y == 3
     
-    // 在 .await 之前，x 的值是 2
+    // 在 .await 之前，y 的值是 3
     // 这个值需要在暂停时被保存，因为后续代码会使用它
-    some_other_future().await;  // 暂停点
+    futures::future::ready(42).await;  // 暂停点
     
-    // .await 完成后，x 的值（2）被恢复，继续使用
-    x = x + 10;                 // x 从 2 变成 12
-    if x > 10 {                 // 使用 x 进行条件判断
-        return x;               // 使用 x 作为返回值
-    }
-    x                           // 返回 x
+    // .await 完成后，y 的值（3）被恢复，继续使用
+    let result = y + 10;        // result = 3 + 10 = 13
+    result                       // 返回 result
 }
 ```
 
-**关于 `some_other_future()`**：
+**关于 `futures::future::ready(42)`**：
 
-`some_other_future()` 是一个返回 `impl Future<Output = ()>` 的函数。它可以是：
+`futures::future::ready(42)` 是一个返回 `impl Future<Output = i32>` 的函数。它可以是：
 - 另一个 `async fn` 的调用
-- `async` 块的调用
+- `async` 块的调用（等价的写法：`async { 42 }.await`）
 - 任何实现了 `Future` trait 的类型（如 `futures::future::Ready<T>`、`futures::future::Pending` 等）
 
 **`.await` 的去糖过程**：
 
-`some_other_future().await` 会被去糖为以下伪 Rust 代码：
+`futures::future::ready(42).await` 会被去糖为以下伪 Rust 代码：
 
 ```rust
 // 1. 首先调用 IntoFuture::into_future 将表达式转换为 Future
-//    对于 ready(())，IntoFuture::into_future 直接返回它本身
-match IntoFuture::into_future(futures::future::ready(())) {
+//    对于 ready(42)，IntoFuture::into_future 直接返回它本身
+match IntoFuture::into_future(futures::future::ready(42)) {
     mut __awaitee => loop {
         // 2. 在循环中调用 Future::poll
         match unsafe { Future::poll(
@@ -294,12 +286,12 @@ enum State {
     Unresumed,                          // 状态 0：未开始（Unresumed）
     Returned,                           // 状态 1：已完成（Returned）
     Panicked,                           // 状态 2：已销毁（Panicked）
-    Suspend0(SomeOtherFuture),          // 状态 3：第一个暂停点（Suspend0）
+    Suspend0(Ready<i32>),               // 状态 3：第一个暂停点（Suspend0）
 }
 
 struct FooFuture {
     state: State,  // 实际编译器生成的是 state: u32
-    x: i32,  // 需要跨 .await 存活的变量被提升到这里
+    y: i32,  // 需要跨 .await 存活的变量被提升到这里
 }
 ```
 
@@ -478,31 +470,27 @@ impl Coroutine<ResumeTy> for FooFuture {
         // }
         match self.state {
                 State::Unresumed => {  // 状态 0：未开始
-                    // x 的用途说明：
-                    // 1. x 在 .await 之前被使用和修改
-                    // 2. x 在 .await 之后继续被使用（用于条件判断和作为返回值）
-                    // 3. 因此 x 必须被"提升"到 FooFuture 结构体中保存
-                    // 4. 这样在协程暂停（yield）和恢复（resume）时，x 的值才能被正确保存和恢复
-                    self.x = 1;
-                    self.x += 1;  // x == 2（在 .await 之前，x 的值是 2）
+                    // y 的用途说明：
+                    // 1. y 在 .await 之前被计算（y = x + 2 = 3）
+                    // 2. y 在 .await 之后继续被使用（用于计算 result = y + 10）
+                    // 3. 因此 y 必须被"提升"到 FooFuture 结构体中保存
+                    // 4. 这样在协程暂停（yield）和恢复（resume）时，y 的值才能被正确保存和恢复
+                    let x = 1;
+                    self.y = x + 2;  // y == 3（在 .await 之前，y 的值是 3）
 
-                    let mut sub = some_other_future();
+                    let mut sub = futures::future::ready(42);
                     match Pin::new(&mut sub).poll(cx) {
-                        Poll::Ready(()) => {
+                        Poll::Ready(_awaited_value) => {
                             // 子 Future 立即完成，继续往下执行
-                            // 使用保存的 x 值（2）继续计算
-                            self.x += 10;  // x 从 2 变成 12
-                            if self.x > 10 {  // 使用 x 进行条件判断
-                                self.state = State::Returned;  // 状态 1：已完成
-                                return CoroutineState::Complete(self.x);  // 使用 x 作为返回值
-                            }
+                            // 使用保存的 y 值（3）继续计算
+                            let result = self.y + 10;  // result = 3 + 10 = 13
                             self.state = State::Returned;  // 状态 1：已完成
-                            return CoroutineState::Complete(self.x);
+                            return CoroutineState::Complete(result);  // 返回 result
                         }
                         Poll::Pending => {
                             // 子 Future 未完成，保存状态并暂停
-                            // 此时 self.x == 2，这个值会被保存在 FooFuture 结构体中
-                            // 当协程恢复时，可以从 self.x 中恢复这个值，用于后续的条件判断和返回值
+                            // 此时 self.y == 3，这个值会被保存在 FooFuture 结构体中
+                            // 当协程恢复时，可以从 self.y 中恢复这个值，用于后续的计算
                             self.state = State::Suspend0(sub);  // 状态 3：第一个暂停点
                             return CoroutineState::Yielded(());
                         }
@@ -511,22 +499,18 @@ impl Coroutine<ResumeTy> for FooFuture {
 
                 State::Suspend0(ref mut sub) => {  // 状态 3：第一个暂停点
                     match Pin::new(sub).poll(cx) {
-                        Poll::Ready(()) => {
+                        Poll::Ready(_awaited_value) => {
                             // 子 Future 完成，继续执行后续代码
-                            // 注意：此时 self.x 的值仍然是 2（从 State::Unresumed 中保存的值）
-                            // 因为 x 被提升到了 FooFuture 结构体中，所以在暂停和恢复之间，x 的值被正确保存
+                            // 注意：此时 self.y 的值仍然是 3（从 State::Unresumed 中保存的值）
+                            // 因为 y 被提升到了 FooFuture 结构体中，所以在暂停和恢复之间，y 的值被正确保存
                             // 现在可以使用这个保存的值继续计算
-                            self.x += 10;  // 从之前的 2 变成 12
-                            if self.x > 10 {  // 使用 x 进行条件判断（x 的实际用途）
-                                self.state = State::Returned;  // 状态 1：已完成
-                                return CoroutineState::Complete(self.x);  // 使用 x 作为返回值（x 的实际用途）
-                            }
+                            let result = self.y + 10;  // result = 3 + 10 = 13
                             self.state = State::Returned;  // 状态 1：已完成
-                            return CoroutineState::Complete(self.x);
+                            return CoroutineState::Complete(result);  // 返回 result
                         }
                         Poll::Pending => {
                             // 仍然未完成，继续暂停
-                            // x 的值（2）仍然保存在 self.x 中，等待下次恢复
+                            // y 的值（3）仍然保存在 self.y 中，等待下次恢复
                             return CoroutineState::Yielded(());
                         }
                     }
@@ -893,44 +877,42 @@ async fn example() -> i32 {
 - 代码被拆分成多个阶段，在不同的 `poll` 调用中执行。
 - 如果有多个 `.await`，状态枚举会相应增加更多变体。
 
-**关于变量 `x` 的详细说明**：
+**关于变量 `y` 的详细说明**：
 
-`x` 在这个例子中用于演示**跨暂停点存活的变量**（variables live across suspension points）的概念：
+`y` 在这个例子中用于演示**跨暂停点存活的变量**（variables live across suspension points）的概念：
 
-1. **`x` 的生命周期跨越了 `.await`**：
-   - 在 `.await` **之前**：`x` 被初始化为 1，然后加 1 变成 2
-   - 在 `.await` **之后**：`x` 被加上 10，变成 12，然后**被实际使用**：
-      - 用于条件判断：`if x > 10 { ... }`
-      - 作为返回值：`return x`
+1. **`y` 的生命周期跨越了 `.await`**：
+   - 在 `.await` **之前**：`y` 被计算为 `x + 2 = 1 + 2 = 3`
+   - 在 `.await` **之后**：`y` 被用于计算 `result = y + 10 = 3 + 10 = 13`，然后作为返回值返回
 
-2. **为什么 `x` 必须被提升到 `FooFuture` 结构体中**：
+2. **为什么 `y` 必须被提升到 `FooFuture` 结构体中**：
    - 当协程在 `.await` 处暂停（yield）时，函数栈会被销毁
-   - 如果 `x` 只是普通的局部变量，它的值会在暂停时丢失
-   - 因此编译器必须将 `x` "提升"（promote）到 `FooFuture` 结构体中，作为结构体的字段保存
-   - 这样在协程恢复（resume）时，`x` 的值（2）才能被正确恢复，并用于：
-      - 继续计算：`x += 10`
-      - 条件判断：`if x > 10 { ... }`
-      - 作为返回值：`return x`
+   - 如果 `y` 只是普通的局部变量，它的值会在暂停时丢失
+   - 因此编译器必须将 `y` "提升"（promote）到 `FooFuture` 结构体中，作为结构体的字段保存
+   - 这样在协程恢复（resume）时，`y` 的值（3）才能被正确恢复，并用于：
+      - 继续计算：`result = y + 10`
+      - 作为返回值：`return result`
 
-3. **`x` 的值在不同状态下的变化及其实际用途**：
-   - **初始状态**：`x = 0`（在 `FooFuture { state: State::Unresumed, x: 0 }` 中初始化）
-   - **State::Unresumed 执行后**：`x = 1`，然后 `x += 1`，所以 `x == 2`
-   - **暂停时**：如果 `some_other_future().await` 返回 `Poll::Pending`，协程会暂停，此时 `x == 2` 被保存在 `FooFuture` 结构体中，状态变为 `State::Suspend0`（状态 3）
-   - **恢复后**：当协程从 `State::Suspend0` 恢复时，`x` 的值仍然是 2（从结构体中恢复）
-   - **最终状态**：`x += 10`，所以 `x == 12`
-   - **`x` 的实际用途**：
-      - 用于条件判断：`if x > 10 { ... }`（使用保存的 x 值进行业务逻辑判断）
-      - 作为返回值：`return x`（使用保存的 x 值作为函数的返回值）
+3. **`y` 的值在不同状态下的变化及其实际用途**：
+   - **初始状态**：`y = 0`（在 `FooFuture { state: State::Unresumed, y: 0 }` 中初始化）
+   - **State::Unresumed 执行后**：`y = x + 2 = 1 + 2 = 3`
+   - **暂停时**：如果 `futures::future::ready(42).await` 返回 `Poll::Pending`，协程会暂停，此时 `y == 3` 被保存在 `FooFuture` 结构体中，状态变为 `State::Suspend0`（状态 3）
+   - **恢复后**：当协程从 `State::Suspend0` 恢复时，`y` 的值仍然是 3（从结构体中恢复）
+   - **最终状态**：`result = y + 10 = 3 + 10 = 13`
+   - **`y` 的实际用途**：
+      - 用于计算返回值：`result = y + 10`（使用保存的 y 值进行计算）
+      - 作为返回值的一部分：`return result`（result 的值依赖于 y）
 
-4. **如果 `x` 不被提升会发生什么**：
-   - 如果 `x` 只是普通的局部变量，在协程暂停时，函数栈会被销毁
-   - 当协程恢复时，`x` 的值会丢失，无法继续使用
+4. **如果 `y` 不被提升会发生什么**：
+   - 如果 `y` 只是普通的局部变量，在协程暂停时，函数栈会被销毁
+   - 当协程恢复时，`y` 的值会丢失，无法继续使用
    - 这会导致编译错误或运行时错误
 
 5. **编译器如何自动识别需要提升的变量**：
    - 编译器会分析变量的生命周期，识别哪些变量在 `.await` 之前被使用，在 `.await` 之后继续被使用
    - 这些变量会被自动提升到 coroutine 结构体中
    - 只有真正需要跨暂停点存活的变量才会被提升，避免不必要的内存开销
+   - **注意**：`x` 不需要提升，因为它在 `.await` 之前就完成了使用，不会在 `.await` 之后被使用
 
 这个例子展示了 Rust 编译器如何自动处理跨暂停点的变量，开发者无需手动管理这些状态。
 
@@ -2259,7 +2241,7 @@ cargo rustc -- -Z mir-opt-level=0 --emit mir  # 未优化的 MIR
 也可以在 [Rust Playground](https://play.rust-lang.org/) 中点击 "MIR" 按钮查看。
 
 ### 总结
-
+z
 HIR 和 MIR 是 Rust 编译器特有的设计，它们的分层架构使得编译器能够：
 - 在 HIR 层面进行高级分析和类型检查
 - 在 MIR 层面进行流敏感的安全检查和优化
